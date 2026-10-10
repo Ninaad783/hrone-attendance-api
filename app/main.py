@@ -189,19 +189,19 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100_000_000_000, le=4_102_444_800_000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 class PunchOutIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100_000_000_000, le=4_102_444_800_000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
 
 
 class RegularizeIn(BaseModel):
     status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
-    punch_in: Optional[int] = Field(None, ge=100_000_000_000, le=4_102_444_800_000)
-    punch_out: Optional[int] = Field(None, ge=100_000_000_000, le=4_102_444_800_000)
+    punch_in: Optional[int] = Field(None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
+    punch_out: Optional[int] = Field(None, strict=True, ge=100_000_000_000, le=4_102_444_800_000)
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
 
@@ -780,6 +780,8 @@ def health():
 @app.post("/employees", status_code=201, tags=["employees"])
 def create_employee(body: EmployeeIn):
     """Create an employee. Enforces unique emp_code via MongoDB unique index."""
+    if db.employees.find_one({"emp_code": body.emp_code}):
+        raise HTTPException(409, "emp_code already exists")
     now_ms = truncate_ms_to_seconds(int(time.time() * 1000))
     created_at_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     doc = body.model_dump()
@@ -823,6 +825,9 @@ def punch_in(body: PunchInIn):
     punch_in_dt = datetime.fromtimestamp(punch_ms / 1000, tz=timezone.utc)
     att_date = get_attendance_date(punch_in_dt, emp["shift_start"], emp["shift_end"])
     late_mins = compute_late_minutes(punch_in_dt, att_date, emp["shift_start"])
+
+    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": att_date}):
+        raise HTTPException(409, "already punched in for this date")
 
     doc = {
         "emp_code": body.emp_code,
@@ -964,12 +969,12 @@ def regularize_attendance(
     if not record:
         raise HTTPException(404, "Attendance record not found")
 
-    # Rule: setting status ABSENT or LEAVE clears both punch times, so supplying punch_in or punch_out with it is 422
-    if body.status in ("ABSENT", "LEAVE") and (body.punch_in is not None or body.punch_out is not None):
-        raise HTTPException(422, "Cannot supply punch_in or punch_out when setting status to ABSENT or LEAVE")
-
     old_status = record.get("status")
     new_status = body.status if body.status is not None else old_status
+
+    # Rule: setting status ABSENT or LEAVE clears both punch times, so supplying punch_in or punch_out with it is 422
+    if new_status in ("ABSENT", "LEAVE") and (body.punch_in is not None or body.punch_out is not None):
+        raise HTTPException(422, "Cannot supply punch_in or punch_out when setting status to ABSENT or LEAVE")
 
     old_punch_in = record.get("punch_in")
     if old_punch_in and old_punch_in.tzinfo is None:
@@ -1061,12 +1066,16 @@ def regularize_attendance(
         "changes": changes,
     }
 
-    existing_history = record.get("history") or []
+    if "history" in record and record["history"] is not None:
+        history_filter = {"history": record["history"]}
+    else:
+        history_filter = {"$or": [{"history": {"$exists": False}}, {"history": []}]}
+
+    update_filter = {"_id": record["_id"]}
+    update_filter.update(history_filter)
+
     updated = db.attendance_logs.find_one_and_update(
-        {
-            "_id": record["_id"],
-            "history": existing_history,
-        },
+        update_filter,
         {
             "$set": {
                 "status": new_status,

@@ -1,7 +1,8 @@
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -72,6 +73,28 @@ def test_punch_out_edge_cases():
         assert res.status_code == 422
 
 
+def test_strict_epoch_millis_rejection():
+    # String timestamps should be rejected with 422
+    res = client.post("/attendance/punch-in", json={
+        "emp_code": "EMP0001",
+        "punched_at": "1783312500000"
+    })
+    assert res.status_code == 422
+
+    res = client.post("/attendance/punch-out", json={
+        "emp_code": "EMP0001",
+        "punched_at": "1783312500000"
+    })
+    assert res.status_code == 422
+
+    res = client.patch("/attendance/EMP0001/2026-07-06", json={
+        "punch_in": "1783312500000",
+        "reason": "testing string rejection",
+        "regularized_by": "admin"
+    })
+    assert res.status_code == 422
+
+
 def test_regularize_attendance_rules():
     emp_mock = {"emp_code": "EMP0001", "shift_start": "09:30", "shift_end": "18:30"}
     record_mock = {
@@ -120,3 +143,43 @@ def test_regularize_attendance_rules():
             "regularized_by": "manager"
         })
         assert res.status_code == 422
+
+    # Happy path regularize update
+    updated_record = {**record_mock, "status": "WFH"}
+    with patch.object(Collection, "find_one", side_effect=find_one_regularize), \
+         patch.object(Collection, "find_one_and_update", return_value=updated_record):
+        res = client.patch("/attendance/EMP0001/2026-07-06", json={
+            "status": "WFH",
+            "reason": "Worked from home approved",
+            "regularized_by": "manager"
+        })
+        assert res.status_code == 200
+        assert res.json()["status"] == "WFH"
+
+    # Concurrent modification conflict returns 409
+    with patch.object(Collection, "find_one", side_effect=find_one_regularize), \
+         patch.object(Collection, "find_one_and_update", return_value=None):
+        res = client.patch("/attendance/EMP0001/2026-07-06", json={
+            "status": "WFH",
+            "reason": "Worked from home approved",
+            "regularized_by": "manager"
+        })
+        assert res.status_code == 409
+
+
+def test_explain_endpoint_validation():
+    # Missing required month for employee_monthly -> 422
+    res = client.get("/admin/explain/employee_monthly?emp_code=EMP0001")
+    assert res.status_code == 422
+
+    # Missing required emp_code for employee_monthly -> 422
+    res = client.get("/admin/explain/employee_monthly?month=2026-07")
+    assert res.status_code == 422
+
+    # Missing required month for department_summary -> 422
+    res = client.get("/admin/explain/department_summary")
+    assert res.status_code == 422
+
+    # Missing required department, from, to for department_trend -> 422
+    res = client.get("/admin/explain/department_trend?department=Engineering")
+    assert res.status_code == 422
